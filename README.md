@@ -78,6 +78,29 @@ isps:
 
 ```bash
 go build -o /usr/sbin/netrt main.go
+```
+
+创建 systemd 服务文件 `/etc/systemd/system/netrt.service`：
+
+```ini
+[Unit]
+Description=NetRoute Manager Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/netrt
+Restart=always
+RestartSec=15
+StandardOutput=append:/var/log/netrt.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
 systemctl daemon-reload
 systemctl enable --now netrt
 ```
