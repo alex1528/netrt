@@ -74,7 +74,27 @@ isps:
 
 ## 安装
 
-### 手动编译
+### 下载预编译二进制
+
+在 [Releases](../../releases) 页面下载对应架构的二进制文件：
+
+| 文件名 | 适用平台 |
+|---|---|
+| `netrt_linux_amd64` | x86_64 服务器 |
+| `netrt_linux_arm64` | ARM64（树莓派4、龙芯等） |
+| `netrt_linux_armv7` | ARMv7（树莓派2/3） |
+| `netrt_linux_386` | x86 32位 |
+| `netrt_linux_mipsle` | MIPS 小端（路由器等） |
+
+```bash
+# 以 amd64 为例
+chmod +x netrt_linux_amd64
+mv netrt_linux_amd64 /usr/sbin/netrt
+```
+
+### 从源码编译
+
+### 从源码编译
 
 ```bash
 go build -o /usr/sbin/netrt main.go
