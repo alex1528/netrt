@@ -524,8 +524,14 @@ func runDetectLoop() {
 		var fallbackGW string // 可用备用网关
 
 		for _, isp := range conf.ISPs {
+			// src_ip 留空时，通过网关自动探测本机出口 IP
 			if isp.SrcIP == "" {
-				continue // 没有 src_ip 无法绑定出口探测
+				localIP, _, err := findInterfaceInfo(isp.Gateway)
+				if err != nil || localIP == "" {
+					logger("[探测] %s (gw:%s) 无法探测出口IP，跳过\n", isp.Name, isp.Gateway)
+					continue
+				}
+				isp.SrcIP = localIP
 			}
 			aliveCount := probeISP(isp, dc.DestIPs, dc.ProbePort, dc.TimeoutSecs)
 			logger("[探测] %s (src:%s gw:%s) 存活探测: %d/%d\n",
