@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.0.9"
+VERSION="1.1.0"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_${VERSION}_${ARCH}"
 
@@ -21,6 +21,7 @@ mkdir -p "$PKG_DIR/etc/netrt"
 mkdir -p "$PKG_DIR/etc/systemd/system"
 mkdir -p "$PKG_DIR/usr/sbin"
 mkdir -p "$PKG_DIR/var/log"
+mkdir -p "$PKG_DIR/var/cache/netrt"
 mkdir -p "$PKG_DIR/usr/share/doc/netrt"
 
 # 2. 编译 Go 程序
@@ -143,8 +144,11 @@ cat <<'EOF' > "$PKG_DIR/usr/share/doc/netrt/README.md"
 ### 核心机制
 - **幂等更新**: 使用 `ip route replace`，不匹配则修正。
 - **自动适配**: 安装时自动将本地网卡 IP 写入 `src_ip` 字段。
-- **安全备份**: 更新前将旧路由备份至 `/tmp/rt_bak_*.txt`。
-EOF
+- **安全备份**: 更新前将旧路由备份至 `/tmp/rt_bak_*.txt`。- **下载重试**: 远程路由列表下载失败时自动重试3次（间隔6秒）。
+- **本地缓存降级**: 下载成功后缓存至 \`/var/cache/netrt/\`，网络不可用时自动使用缓存。
+- **路由去重**: 同一 CIDR 前缀不会重复写入主路由表。
+- **默认网关智能跳过**: ISP 网关与系统默认网关相同时，不添加冗余主表路由。
+- **路由看门狗**: 每5分钟检查 ISP 网关是否在路由表中，缺失时自动重载。EOF
 
 # 6. 写入 DEBIAN/control
 cat <<EOF > "$PKG_DIR/DEBIAN/control"
@@ -209,9 +213,21 @@ systemctl disable netrt.service
 exit 0
 EOF
 
+# 8.1 写入 DEBIAN/postrm (卸载后清理缓存)
+cat <<'EOF' > "$PKG_DIR/DEBIAN/postrm"
+#!/bin/bash
+if [ "$1" = "purge" ]; then
+    rm -rf /var/cache/netrt
+    rm -rf /etc/netrt
+    rm -f /var/log/netrt.log
+fi
+exit 0
+EOF
+
 # 9. 设置权限并打包
 chmod 755 "$PKG_DIR/DEBIAN/postinst"
 chmod 755 "$PKG_DIR/DEBIAN/prerm"
+chmod 755 "$PKG_DIR/DEBIAN/postrm"
 echo "正在生成 .deb 安装包..."
 dpkg-deb --build "$PKG_DIR"
 
