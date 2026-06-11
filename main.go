@@ -176,6 +176,8 @@ func runTask() {
 	}
 
 	// 2. 处理各 ISP (包含私网和公网)
+	// 用于跟踪已同步到主表的 CIDR，避免多 ISP 重复写入
+	mainTableSynced := make(map[string]bool)
 	for _, isp := range conf.ISPs {
 		logger("[ISP] 正在同步：%s\n", isp.Name)
 
@@ -227,9 +229,13 @@ func runTask() {
 				// 1. 添加到 ISP 专用路由表
 				applyRoute(t, isp.Gateway, isp.Table, device)
 
-				// 2. 如果配置了 sync_to_main，同时添加到主路由表
+				// 2. 如果配置了 sync_to_main，同时添加到主路由表（同一前缀只添加一次）
 				if isp.SyncToMain {
-					applyRoute(t, isp.Gateway, "", device)
+					norm := normalizeCIDR(t)
+					if !mainTableSynced[norm] {
+						mainTableSynced[norm] = true
+						applyRouteClean(t, isp.Gateway, "", device)
+					}
 				}
 
 				addedCount++
@@ -585,6 +591,36 @@ func applyRoute(target, via, table, dev string) {
 	exec.Command("ip", args...).Run()
 }
 
+// applyRouteClean: 先删除目标前缀的所有旧路由（含不同 metric），再添加新路由
+// 用于主路由表同步，避免因 metric 不同导致的重复条目
+func applyRouteClean(target, via, table, dev string) {
+	if !strings.Contains(target, "/") {
+		target += "/32"
+	}
+
+	// 先删除该前缀在目标表中的所有现有路由（循环删除直到无匹配）
+	for i := 0; i < 10; i++ {
+		delArgs := []string{"route", "del", target}
+		if table != "" {
+			delArgs = append(delArgs, "table", table)
+		}
+		if err := exec.Command("ip", delArgs...).Run(); err != nil {
+			break // 无更多匹配路由
+		}
+	}
+
+	// 再添加唯一一条新路由
+	addArgs := []string{"route", "add", target, "via", via}
+	if dev != "" {
+		addArgs = append(addArgs, "dev", dev)
+	}
+	if table != "" {
+		addArgs = append(addArgs, "table", table)
+	}
+
+	exec.Command("ip", addArgs...).Run()
+}
+
 // fetchAndVerifyRoutes: 从远程获取内容并验证合法性
 // 支持格式 1: route add -net 223.252.221.0/24 gw DESTGW
 // 支持格式 2: add address=223.252.214.0/23 comment="" list=List_ChinaTelecom
@@ -648,7 +684,30 @@ func fetchAndVerifyRoutes(url string) ([]string, error) {
 		return nil, fmt.Errorf("解析完成，但未发现任何合法的路由条目")
 	}
 
-	return targets, nil
+	// 去重：相同 CIDR 只保留第一次出现
+	seen := make(map[string]bool, len(targets))
+	uniq := targets[:0]
+	for _, t := range targets {
+		normalized := normalizeCIDR(t)
+		if !seen[normalized] {
+			seen[normalized] = true
+			uniq = append(uniq, t)
+		}
+	}
+
+	return uniq, nil
+}
+
+// normalizeCIDR: 规范化 CIDR 表示，确保网络地址一致（如 1.2.4.5/24 → 1.2.4.0/24）
+func normalizeCIDR(cidr string) string {
+	if !strings.Contains(cidr, "/") {
+		cidr += "/32"
+	}
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return cidr
+	}
+	return ipNet.String()
 }
 
 // ensureRtTable: 倒序分配 ID (252 往下)，注册到 /etc/iproute2/rt_tables
