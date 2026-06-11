@@ -176,9 +176,18 @@ func runTask() {
 	}
 
 	// 2. 处理各 ISP (包含私网和公网)
+	// 获取系统当前默认网关，用于判断是否跳过 defaultrt
+	systemDefaultGW := getDefaultGateway()
+
 	// 用于跟踪已同步到主表的 CIDR，避免多 ISP 重复写入
 	mainTableSynced := make(map[string]bool)
 	for _, isp := range conf.ISPs {
+		// 当 defaultrt 的网关与系统默认网关一致时，无需添加静态路由表项
+		if isp.Table == "defaultrt" && isp.Gateway == systemDefaultGW {
+			logger("[ISP] %s 网关 %s 与系统默认网关一致，跳过\n", isp.Name, isp.Gateway)
+			continue
+		}
+
 		logger("[ISP] 正在同步：%s\n", isp.Name)
 
 		// A. 自动管理路由表 ID (注册到 /etc/iproute2/rt_tables)
