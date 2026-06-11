@@ -247,7 +247,8 @@ func runTask() {
 				applyRoute(t, isp.Gateway, isp.Table, device)
 
 				// 2. 如果配置了 sync_to_main，同时添加到主路由表（同一前缀只添加一次）
-				if isp.SyncToMain {
+				//    但若该 ISP 网关与系统默认网关相同，则跳过（默认路由已覆盖）
+				if isp.SyncToMain && isp.Gateway != systemDefaultGW {
 					norm := normalizeCIDR(t)
 					if !mainTableSynced[norm] {
 						mainTableSynced[norm] = true
