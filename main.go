@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -29,8 +30,12 @@ const (
 	CONFIG              = "/etc/netrt/config.yaml"
 	RT_TABLES           = "/etc/iproute2/rt_tables"
 	LOG_FILE            = "/var/log/netrt.log"
-	DEFAULT_SYNC_HOURS  = 1   // 默认同步间隔（小时）
-	DEFAULT_JITTER_SECS = 600 // 默认随机抖动（秒）
+	ROUTE_CACHE_DIR     = "/var/cache/netrt"
+	DEFAULT_SYNC_HOURS  = 1                // 默认同步间隔（小时）
+	DEFAULT_JITTER_SECS = 600              // 默认随机抖动（秒）
+	MAX_RETRIES         = 3                // 下载最大重试次数
+	RETRY_INTERVAL      = 10 * time.Second // 重试间隔
+	WATCHDOG_INTERVAL   = 5 * time.Minute  // 路由看门狗检查间隔
 )
 
 // ================= 数据结构 =================
@@ -91,6 +96,9 @@ func main() {
 
 	// 启动独立的故障探测 goroutine（与路由同步并行运行）
 	go runDetectLoop()
+
+	// 启动路由看门狗 goroutine（定期检查 ISP 网关是否在路由表中）
+	go runRouteWatchdog()
 
 	for {
 		runTask()
@@ -226,7 +234,7 @@ func runTask() {
 
 		// F. 获取并下发远程路由
 		if isp.RemoteURL != "" {
-			targets, err := fetchAndVerifyRoutes(isp.RemoteURL)
+			targets, err := fetchAndVerifyRoutes(isp.RemoteURL, isp.Table)
 			if err != nil {
 				logger(" [拒绝] 远程数据校验失败：%v\n", err)
 				continue
@@ -582,6 +590,49 @@ func runDetectLoop() {
 	}
 }
 
+// ================= 路由看门狗 =================
+
+// runRouteWatchdog: 定期检查各 ISP 网关是否仍在路由表中，缺失时自动触发重载
+func runRouteWatchdog() {
+	for {
+		time.Sleep(WATCHDOG_INTERVAL)
+
+		conf := loadConfig()
+		if len(conf.ISPs) == 0 {
+			continue
+		}
+
+		// 获取当前完整路由表
+		out, err := exec.Command("ip", "route", "show").Output()
+		if err != nil {
+			continue
+		}
+		routeStr := string(out)
+
+		// 同时检查各 ISP 专用表
+		for _, isp := range conf.ISPs {
+			if isp.Gateway == "" || isp.Table == "" || isp.RemoteURL == "" {
+				continue
+			}
+
+			// 检查该 ISP 网关是否出现在其专用路由表中
+			tableOut, err := exec.Command("ip", "route", "show", "table", isp.Table).Output()
+			if err != nil {
+				continue
+			}
+			tableStr := string(tableOut)
+
+			// 如果专用表中不包含该网关（路由可能被清除了），触发一次完整同步
+			if !strings.Contains(tableStr, isp.Gateway) && !strings.Contains(routeStr, isp.Gateway) {
+				fmt.Printf("[%s] [看门狗] %s 网关 %s 在路由表中缺失，触发重新同步\n",
+					time.Now().Format("15:04:05"), isp.Name, isp.Gateway)
+				runTask()
+				break // 一次 runTask 会同步所有 ISP，无需继续检查
+			}
+		}
+	}
+}
+
 // applyRoute: 应用单条路由（支持主路由表和专用路由表）
 func applyRoute(target, via, table, dev string) {
 	if !strings.Contains(target, "/") {
@@ -630,23 +681,91 @@ func applyRouteClean(target, via, table, dev string) {
 	exec.Command("ip", addArgs...).Run()
 }
 
-// fetchAndVerifyRoutes: 从远程获取内容并验证合法性
+// downloadWithRetry: 带重试的 HTTP 下载
+func downloadWithRetry(url string) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	var lastErr error
+	for i := 1; i <= MAX_RETRIES; i++ {
+		resp, err := client.Get(url)
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				return io.ReadAll(resp.Body)
+			}
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			resp.Body.Close()
+		} else {
+			lastErr = err
+		}
+		if i < MAX_RETRIES {
+			time.Sleep(RETRY_INTERVAL)
+		}
+	}
+	return nil, lastErr
+}
+
+// getCachePath: 获取 ISP 路由的本地缓存文件路径
+func getCachePath(tableName string) string {
+	return fmt.Sprintf("%s/%s.routes", ROUTE_CACHE_DIR, tableName)
+}
+
+// fetchAndVerifyRoutes: 从远程获取内容并验证合法性（带重试和本地缓存降级）
 // 支持格式 1: route add -net 223.252.221.0/24 gw DESTGW
 // 支持格式 2: add address=223.252.214.0/23 comment="" list=List_ChinaTelecom
-func fetchAndVerifyRoutes(url string) ([]string, error) {
-	client := http.Client{Timeout: 25 * time.Second}
-	resp, err := client.Get(url)
+func fetchAndVerifyRoutes(url string, tableName string) ([]string, error) {
+	// 确保缓存目录存在
+	os.MkdirAll(ROUTE_CACHE_DIR, 0755)
+
+	var content []byte
+	var fromCache bool
+
+	// 带重试下载
+	data, err := downloadWithRetry(url)
 	if err != nil {
-		return nil, fmt.Errorf("网络请求失败：%v", err)
+		// 下载失败，尝试使用本地缓存
+		cachePath := getCachePath(tableName)
+		cachedData, cacheErr := os.ReadFile(cachePath)
+		if cacheErr != nil {
+			return nil, fmt.Errorf("网络请求失败：%v（且无本地缓存可用）", err)
+		}
+		content = cachedData
+		fromCache = true
+		fmt.Printf(" [降级] 远程下载失败，使用本地缓存: %s\n", cachePath)
+	} else {
+		content = data
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("服务器返回状态异常：%d", resp.StatusCode)
+	// 解析路由条目
+	targets := parseRouteContent(string(content))
+
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("解析完成，但未发现任何合法的路由条目")
 	}
 
+	// 去重：相同 CIDR 只保留第一次出现
+	seen := make(map[string]bool, len(targets))
+	uniq := targets[:0]
+	for _, t := range targets {
+		normalized := normalizeCIDR(t)
+		if !seen[normalized] {
+			seen[normalized] = true
+			uniq = append(uniq, t)
+		}
+	}
+
+	// 下载成功时更新本地缓存
+	if !fromCache {
+		cachePath := getCachePath(tableName)
+		os.WriteFile(cachePath, content, 0644)
+	}
+
+	return uniq, nil
+}
+
+// parseRouteContent: 从文本内容中解析路由条目
+func parseRouteContent(text string) []string {
 	var targets []string
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(strings.NewReader(text))
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -685,26 +804,7 @@ func fetchAndVerifyRoutes(url string) ([]string, error) {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("读取远程内容时出错：%v", err)
-	}
-
-	if len(targets) == 0 {
-		return nil, fmt.Errorf("解析完成，但未发现任何合法的路由条目")
-	}
-
-	// 去重：相同 CIDR 只保留第一次出现
-	seen := make(map[string]bool, len(targets))
-	uniq := targets[:0]
-	for _, t := range targets {
-		normalized := normalizeCIDR(t)
-		if !seen[normalized] {
-			seen[normalized] = true
-			uniq = append(uniq, t)
-		}
-	}
-
-	return uniq, nil
+	return targets
 }
 
 // normalizeCIDR: 规范化 CIDR 表示，确保网络地址一致（如 1.2.4.5/24 → 1.2.4.0/24）
