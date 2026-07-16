@@ -1,23 +1,17 @@
 # netrt
 
-多线 ISP 策略路由管理守护进程，支持远程路由表自动同步、多出口故障探测与默认路由自动切换。
+多线 ISP 策略路由管理守护进程，支持远程路由同步、策略路由维护、故障探测与默认路由切换。
 
 ## 功能概览
 
-- **多线 ISP 路由同步** — 定期从远程 URL 拉取路由列表，自动下发到各 ISP 专用路由表
-- **策略路由管理** — 自动维护 `ip rule`，为每个 ISP 出口绑定 `from <src_ip> lookup <table>` 规则
-- **故障探测与自动切换** — 独立 goroutine 定期 TCP 探测各出口连通性，默认出口故障时自动切换到可用备用出口
-- **私有 IP 过滤** — 自动过滤 RFC1918 地址（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`），防止私有路由污染 ISP 专用表
-- **路由表自动注册** — 自动分配 ID 并写入 `/etc/iproute2/rt_tables`，无需手动维护
-- **双格式路由解析** — 兼容 Linux `route add -net` 格式和 MikroTik RouterOS `add address=` 格式
-
-## 目录结构
-
-```
-netrt/
-├── main.go       # 主程序
-└── go.mod
-```
+- 多线 ISP 路由同步：定期拉取远程路由并写入各 ISP 专用表
+- 策略路由维护：自动维护 `ip rule`，并清理重复规则
+- 故障探测切换：默认出口故障时自动切换可用出口
+- 主表同步去重：同一 CIDR 前缀不会重复写入主表
+- 默认网关智能跳过：ISP 网关等于系统默认网关时，不写冗余主表静态路由
+- 路由看门狗：周期检查路由缺失并触发重同步
+- `rt_tables` 自愈：缺失时自动初始化 `/etc/iproute2/rt_tables`
+- 特殊目标路由开关：`special_targets_enabled` 默认关闭
 
 ## 配置文件
 
@@ -26,21 +20,22 @@ netrt/
 ```yaml
 # ================= 故障探测配置 =================
 detect:
-  interval_secs: 180     # 探测间隔（秒）
+  interval_secs: 180
   dest_ips:
     - "119.29.29.29"
     - "223.5.5.5"
     - "8.8.8.8"
-  probe_port: 53         # TCP 探测端口
-  min_alive: 1           # 判定存活的最低成功探测数
-  timeout_secs: 3        # 单次探测超时（秒）
+  probe_port: 53
+  min_alive: 1
+  timeout_secs: 3
 
 # ================= 同步策略 =================
 sync:
-  interval_hours: 1      # 路由同步间隔（小时）
-  jitter_secs: 600       # 随机抖动范围（秒），防止集中请求
+  interval_hours: 1
+  jitter_secs: 600
 
 # ================= 全局特殊路由 =================
+special_targets_enabled: false
 gateway: "1.1.1.1"
 targets:
   - "11.11.11.11"
@@ -61,116 +56,64 @@ isps:
     sync_to_main: true
 ```
 
-### ISP 字段说明
+## 依赖
 
-| 字段 | 说明 |
-|---|---|
-| `name` | ISP 标识名 |
-| `gateway` | 该 ISP 出口网关 IP |
-| `src_ip` | 本机对应出口 IP（留空则自动探测） |
-| `table` | 策略路由表名（`defaultrt` 为系统默认表，不添加 ip rule） |
-| `remote_url` | 远程路由列表 URL |
-| `sync_to_main` | 是否同时将路由写入主路由表 |
+- Go 1.21+
+- `ip`（iproute2）
+- systemd（若使用服务安装）
 
-## 安装
-
-### 下载预编译二进制
-
-在 [Releases](../../releases) 页面下载对应架构的二进制文件：
-
-| 文件名 | 适用平台 |
-|---|---|
-| `netrt_linux_amd64` | x86_64 服务器 |
-| `netrt_linux_arm64` | ARM64（树莓派4、龙芯等） |
-| `netrt_linux_armv7` | ARMv7（树莓派2/3） |
-| `netrt_linux_386` | x86 32位 |
-| `netrt_linux_mipsle` | MIPS 小端（路由器等） |
-
-```bash
-# 以 amd64 为例
-chmod +x netrt_linux_amd64
-mv netrt_linux_amd64 /usr/sbin/netrt
-```
-
-### 从源码编译
-
-### 从源码编译
+## 快速构建
 
 ```bash
 go build -o /usr/sbin/netrt main.go
 ```
 
-创建 systemd 服务文件 `/etc/systemd/system/netrt.service`：
-
-```ini
-[Unit]
-Description=NetRoute Manager Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/sbin/netrt
-Restart=always
-RestartSec=15
-StandardOutput=append:/var/log/netrt.log
-StandardError=inherit
-
-[Install]
-WantedBy=multi-user.target
-```
+打包：
 
 ```bash
-systemctl daemon-reload
-systemctl enable --now netrt
+bash make_deb.sh
 ```
 
-## 运行逻辑
+## Git Hooks 集成
 
-程序启动后并行运行两个循环：
+仓库内置 `.githooks/post-commit`，用于自动递增版本 tag 并同步 `make_deb.sh` 中的 `VERSION`。
 
-```
-main()
- ├── goroutine: runDetectLoop()   每 interval_secs 秒
- │    ├── 读取各 ISP 的 gateway / src_ip
- │    ├── TCP 探测各出口到 dest_ips 的连通性
- │    ├── 非默认出口全不通 → 删除其非默认路由
- │    └── 默认出口不通 + 有可用备用 → 替换默认路由
- │
- └── loop: runTask()              每 interval_hours 小时 + 随机抖动
-      ├── 同步全局特殊路由
-      └── 遍历各 ISP
-           ├── 注册路由表 ID
-           ├── flush 并重建默认路由
-           ├── 同步 ip rule（defaultrt 跳过）
-           └── 拉取远程路由列表并下发（过滤私有 IP）
+### 启用 hooks（克隆后执行一次）
+
+```bash
+git config core.hooksPath .githooks
 ```
 
-## 支持的远程路由格式
+### 解决 Windows 下可执行位与换行问题
 
-**Linux 格式**
-```
-route add -net 223.252.221.0/24 gw 1.2.3.4
-```
+仓库已提供 `.gitattributes`，强制 `.githooks/*` 与 `*.sh` 使用 LF。
 
-**MikroTik RouterOS 格式**
-```
-add address=223.252.214.0/23 comment="" list=List_ChinaTelecom
+若需要手动设置可执行位，请使用：
+
+```bash
+git add --chmod=+x -- .githooks/post-commit
 ```
 
-## 依赖
+### post-commit 行为
 
-- Go 1.21+
-- `ip` 命令（iproute2）
+- 不执行 `go build .`
+- 若当前提交未打语义化版本 tag，则自动创建下一个版本 tag
+- 版本从 `v0.0.1` 开始递增，并按“每满 10 进 1”规则进位
+- 同步 `make_deb.sh` 的 `VERSION="x.y.z"`
+
+单次跳过：
+
+```bash
+SKIP_AUTO_TAG=1 git commit -m "message"
+```
 
 ## 日志
 
-运行日志写入 `/var/log/netrt.log`，同时输出到 stdout（systemd journal 可查）。
+- 程序日志：`/var/log/netrt.log`
+- systemd 查看：
 
 ```bash
 journalctl -u netrt -f
-# 或
-tail -f /var/log/netrt.log
 ```
 
 ## License

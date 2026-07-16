@@ -2,9 +2,9 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.1.1"
+VERSION="1.0.3"
 ARCH="amd64"
-PKG_DIR="${APP_NAME}_${VERSION}_${ARCH}"
+PKG_DIR="${APP_NAME}_v${VERSION}_${ARCH}"
 
 # 路径定义
 BIN_TARGET="usr/sbin/$APP_NAME"
@@ -60,6 +60,7 @@ sync:
   jitter_secs: 600     # 随机抖动范围秒数 (原 RANDOM_JITTER_SECS)
 
 # ==== 特殊目标路由 ====
+special_targets_enabled: false
 gateway: "1.1.1.1"
 targets:
   - "11.11.11.11"
@@ -145,7 +146,7 @@ cat <<'EOF' > "$PKG_DIR/usr/share/doc/netrt/README.md"
 - **幂等更新**: 使用 `ip route replace`，不匹配则修正。
 - **自动适配**: 安装时自动将本地网卡 IP 写入 `src_ip` 字段。
 - **安全备份**: 更新前将旧路由备份至 `/tmp/rt_bak_*.txt`。
-- **下载重试**: 远程路由列表下载失败时自动重试3次（间隔6秒）。
+- **下载重试**: 远程路由列表下载失败时自动重试3次（间隔10秒）。
 - **本地缓存降级**: 下载成功后缓存至 \`/var/cache/netrt/\`，网络不可用时自动使用缓存。
 - **路由去重**: 同一 CIDR 前缀不会重复写入主路由表。
 - **默认网关智能跳过**: ISP 网关与系统默认网关相同时，不添加冗余主表路由。

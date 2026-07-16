@@ -64,11 +64,12 @@ type DetectConfig struct {
 }
 
 type Config struct {
-	Gateway string       `yaml:"gateway"`
-	Targets []string     `yaml:"targets"`
-	ISPs    []ISPConfig  `yaml:"isps"`
-	Sync    SyncConfig   `yaml:"sync"`
-	Detect  DetectConfig `yaml:"detect"`
+	SpecialTargetsEnabled bool         `yaml:"special_targets_enabled"`
+	Gateway               string       `yaml:"gateway"`
+	Targets               []string     `yaml:"targets"`
+	ISPs                  []ISPConfig  `yaml:"isps"`
+	Sync                  SyncConfig   `yaml:"sync"`
+	Detect                DetectConfig `yaml:"detect"`
 }
 
 // ================= 全局变量 =================
@@ -175,7 +176,7 @@ func runTask() {
 	}
 
 	// 1. 处理基础全局路由 (带网关地址范围校验，支持私有地址)
-	if conf.Gateway != "" && len(conf.Targets) > 0 {
+	if conf.SpecialTargetsEnabled && conf.Gateway != "" && len(conf.Targets) > 0 {
 		// 检查本机是否有网卡 IP 与 gateway 在同一网段（包含私有地址）
 		matchedIP, matchedDev, isInRange := checkGatewayRange(conf.Gateway)
 		if isInRange {
@@ -195,6 +196,8 @@ func runTask() {
 				logger("[全局] 网关 %s 不在本机网卡地址范围内，跳过特殊路由规则\n", conf.Gateway)
 			}
 		}
+	} else if !conf.SpecialTargetsEnabled && len(conf.Targets) > 0 {
+		logger("[全局] 特殊目标路由开关未启用，跳过 %d 条目标\n", len(conf.Targets))
 	}
 
 	// 2. 处理各 ISP (包含私网和公网)

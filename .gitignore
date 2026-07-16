@@ -3,4 +3,4 @@
 *.txt
 netrt.exe
 route_detect.sh
-/netrt_1.1.1_amd64
+/netrt_*_amd64
