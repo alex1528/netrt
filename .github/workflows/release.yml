@@ -6,23 +6,12 @@ on:
       - "v*"
 
 jobs:
-  build:
+  release:
     name: Build & Release
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        include:
-          - goarch: amd64
-            goarm: ""
-          - goarch: arm64
-            goarm: ""
-          - goarch: arm
-            goarm: "7"
-          - goarch: "386"
-            goarm: ""
-          - goarch: mipsle
-            goarm: ""
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -33,38 +22,30 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
+      - name: Build all targets
         env:
           GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: "0"
         run: |
-          SUFFIX="${{ matrix.goarch }}"
-          if [ -n "${{ matrix.goarm }}" ]; then SUFFIX="${SUFFIX}v${{ matrix.goarm }}"; fi
-          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
-            -o "netrt_linux_${SUFFIX}" main.go
+          set -eu
+          for target in amd64 arm64 armv7 386 mipsle; do
+            case "$target" in
+              armv7)
+                GOARCH=arm
+                GOARM=7
+                SUFFIX=armv7
+                ;;
+              *)
+                GOARCH="$target"
+                GOARM=
+                SUFFIX="$target"
+                ;;
+            esac
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: netrt_linux_${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
-          path: netrt_linux_*
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v5
-        with:
-          merge-multiple: true
-          path: dist/
+            GOARCH="$GOARCH" GOARM="$GOARM" \
+              go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+              -o "netrt_linux_${SUFFIX}" main.go
+          done
 
       - name: Create GitHub Release
         env:
@@ -72,9 +53,9 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" dist/netrt_linux_* --clobber
+            gh release upload "${{ github.ref_name }}" netrt_linux_* --clobber
           else
-            gh release create "${{ github.ref_name }}" dist/netrt_linux_* \
+            gh release create "${{ github.ref_name }}" netrt_linux_* \
               --generate-notes \
               --title "${{ github.ref_name }}"
           fi
