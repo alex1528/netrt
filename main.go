@@ -260,14 +260,17 @@ func runTask() {
 				// 1. 添加到 ISP 专用路由表
 				applyRoute(t, isp.Gateway, isp.Table, device)
 
-				// 2. 如果配置了 sync_to_main，同时添加到主路由表（同一前缀只添加一次）
-				//    但若该 ISP 网关与系统默认网关相同，则跳过（默认路由已覆盖）
-				if isp.SyncToMain && isp.Gateway != systemDefaultGW {
-					norm := normalizeCIDR(t)
+				norm := normalizeCIDR(t)
+				allowMainSync := isp.SyncToMain && isp.Gateway != systemDefaultGW
+
+				// 2. 主路由表同步：仅在允许条件下写入，否则清理该 ISP 对应静态路由残留
+				if allowMainSync {
 					if !mainTableSynced[norm] {
 						mainTableSynced[norm] = true
 						applyRouteClean(t, isp.Gateway, "", device)
 					}
+				} else if !mainTableSynced[norm] {
+					removeRouteClean(t, "")
 				}
 
 				addedCount++
@@ -674,15 +677,7 @@ func applyRouteClean(target, via, table, dev string) {
 	}
 
 	// 先删除该前缀在目标表中的所有现有路由（循环删除直到无匹配）
-	for i := 0; i < 10; i++ {
-		delArgs := []string{"route", "del", target}
-		if table != "" {
-			delArgs = append(delArgs, "table", table)
-		}
-		if err := exec.Command("ip", delArgs...).Run(); err != nil {
-			break // 无更多匹配路由
-		}
-	}
+	removeRouteClean(target, table)
 
 	// 再添加唯一一条新路由
 	addArgs := []string{"route", "add", target, "via", via}
@@ -694,6 +689,23 @@ func applyRouteClean(target, via, table, dev string) {
 	}
 
 	exec.Command("ip", addArgs...).Run()
+}
+
+// removeRouteClean: 删除目标前缀在指定路由表中的所有路由项（含不同 metric）
+func removeRouteClean(target, table string) {
+	if !strings.Contains(target, "/") {
+		target += "/32"
+	}
+
+	for i := 0; i < 10; i++ {
+		delArgs := []string{"route", "del", target}
+		if table != "" {
+			delArgs = append(delArgs, "table", table)
+		}
+		if err := exec.Command("ip", delArgs...).Run(); err != nil {
+			break
+		}
+	}
 }
 
 // downloadWithRetry: 带重试的 HTTP 下载
