@@ -61,13 +61,20 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           merge-multiple: true
           path: dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/netrt_linux_*
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" dist/netrt_linux_* --clobber
+          else
+            gh release create "${{ github.ref_name }}" dist/netrt_linux_* \
+              --generate-notes \
+              --title "${{ github.ref_name }}"
+          fi
