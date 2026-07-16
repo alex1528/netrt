@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.1.0"
+VERSION="1.1.1"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_${VERSION}_${ARCH}"
 

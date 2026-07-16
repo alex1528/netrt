@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -72,6 +73,19 @@ type Config struct {
 
 // ================= 全局变量 =================
 var cidrRegex = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$`)
+
+const defaultRtTablesContent = `#
+# reserved values
+#
+255     local
+254     main
+253     default
+0       unspec
+#
+# local
+#
+#1      inr.ruhep
+`
 
 // ================= 主函数 =================
 func main() {
@@ -822,6 +836,10 @@ func normalizeCIDR(cidr string) string {
 
 // ensureRtTable: 倒序分配 ID (252 往下)，注册到 /etc/iproute2/rt_tables
 func ensureRtTable(tableName string) error {
+	if err := ensureRtTablesFile(); err != nil {
+		return err
+	}
+
 	content, err := os.ReadFile(RT_TABLES)
 	if err != nil {
 		return err
@@ -865,4 +883,21 @@ func ensureRtTable(tableName string) error {
 
 	_, err = f.WriteString(fmt.Sprintf("%d\t%s\n", newID, tableName))
 	return err
+}
+
+// ensureRtTablesFile: 当 /etc/iproute2/rt_tables 缺失或为空时，自动初始化为系统默认模板
+func ensureRtTablesFile() error {
+	info, err := os.Stat(RT_TABLES)
+	if err == nil && info.Size() > 0 {
+		return nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(RT_TABLES), 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(RT_TABLES, []byte(defaultRtTablesContent), 0644)
 }

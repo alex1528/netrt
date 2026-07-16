@@ -1,0 +1,6 @@
+.copilot-specs-cache/
+.kiro/
+*.txt
+netrt.exe
+route_detect.sh
+/netrt_1.1.1_amd64
