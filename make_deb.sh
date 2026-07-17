@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.1.0"
+VERSION="1.1.1"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_v${VERSION}_${ARCH}"
 
@@ -49,6 +49,8 @@ detect:
     - "8.8.4.4"
   # 探测协议：tcp / udp / icmp
   probe_protocol: "udp"
+  # 默认网关及路由切换开关（默认启用）
+  route_switch_enabled: true
   # 探测端口（tcp/udp 使用）
   probe_port: 53
   # tcp 分组探测（可选）：按 ISP 名称强制分组，不再依赖 CIDR 判定

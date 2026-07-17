@@ -27,6 +27,7 @@ detect:
     - "223.5.5.5"
     - "8.8.8.8"
   probe_protocol: "udp"  # tcp / udp / icmp
+  route_switch_enabled: true  # 默认网关及路由切换开关（默认启用）
   probe_port: 53
   cn_probe_isps:          # 仅 tcp 生效：强制走大陆域名组的 ISP 名称
     - "ctc"

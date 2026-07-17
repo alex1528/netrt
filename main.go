@@ -60,6 +60,7 @@ type DetectConfig struct {
 	IntervalSecs     int      `yaml:"interval_secs"`      // 探测间隔（秒）
 	DestIPs          []string `yaml:"dest_ips"`           // 探测目的IP列表
 	ProbeProtocol    string   `yaml:"probe_protocol"`     // 探测协议: tcp/udp/icmp
+	RouteSwitchEnabled *bool   `yaml:"route_switch_enabled"` // 默认网关及路由切换开关（未配置默认启用）
 	ProbePort        int      `yaml:"probe_port"`         // 探测端口（tcp/udp 使用）
 	CNProbeISPs      []string `yaml:"cn_probe_isps"`      // 强制走大陆域名组的 ISP 名称
 	IntlProbeISPs    []string `yaml:"intl_probe_isps"`    // 强制走海外域名组的 ISP 名称
@@ -876,6 +877,10 @@ func runDetectLoop() {
 		if dc.TimeoutSecs <= 0 {
 			dc.TimeoutSecs = DEFAULT_PROBE_TIMEOUT
 		}
+		routeSwitchEnabled := true
+		if dc.RouteSwitchEnabled != nil {
+			routeSwitchEnabled = *dc.RouteSwitchEnabled
+		}
 		hasDomainGroups := probeProtocol == "tcp" &&
 			(len(dc.CNProbeDomains) > 0 || len(dc.IntlProbeDomains) > 0) &&
 			(len(dc.CNProbeISPs) > 0 || len(dc.IntlProbeISPs) > 0)
@@ -902,7 +907,7 @@ func runDetectLoop() {
 		if probeProtocol != "icmp" {
 			probeMode = fmt.Sprintf("%s:%d", strings.ToUpper(probeProtocol), dc.ProbePort)
 		}
-		logger("=== 故障探测开始 (mode:%s dest:%v) ===\n", probeMode, dc.DestIPs)
+		logger("=== 故障探测开始 (mode:%s switch:%v dest:%v) ===\n", probeMode, routeSwitchEnabled, dc.DestIPs)
 
 		ispGroupMap := buildISPGroupMap(dc.CNProbeISPs, dc.IntlProbeISPs)
 		cnTargets := resolveDomainsToIPv4(dc.CNProbeDomains, dc.TimeoutSecs)
@@ -975,8 +980,12 @@ func runDetectLoop() {
 					defaultISPDown = true
 					logger("[探测] 默认出口 %s 不通\n", isp.Name)
 				} else {
-					// 非默认出口全不通 → 删除其非默认路由
-					deleteISPRoutes(isp, logger)
+					if routeSwitchEnabled {
+						// 非默认出口全不通 → 删除其非默认路由
+						deleteISPRoutes(isp, logger)
+					} else {
+						logger("[探测] 路由切换开关已关闭，跳过删除出口 %s 的路由\n", isp.Name)
+					}
 				}
 			} else if !isDefault {
 				// 非默认出口可用，记录为备用
@@ -988,8 +997,10 @@ func runDetectLoop() {
 		}
 
 		// 当默认出口不通且有可用备用出口时，替换默认路由
-		if defaultISPDown && fallbackGW != "" {
+		if routeSwitchEnabled && defaultISPDown && fallbackGW != "" {
 			replaceDefaultGateway(currentDefaultGW, fallbackGW, logger)
+		} else if !routeSwitchEnabled && defaultISPDown {
+			logger("[探测] 路由切换开关已关闭，默认出口故障时不执行切换\n")
 		}
 
 		logger("=== 故障探测结束 ===\n")
