@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"math/rand"
@@ -56,11 +57,16 @@ type SyncConfig struct {
 
 // DetectConfig 对应 config.yaml 中的 detect 节
 type DetectConfig struct {
-	IntervalSecs int      `yaml:"interval_secs"` // 探测间隔（秒）
-	DestIPs      []string `yaml:"dest_ips"`      // 探测目的IP列表
-	ProbePort    int      `yaml:"probe_port"`    // TCP 探测端口，0 表示 ICMP
-	MinAlive     int      `yaml:"min_alive"`     // 判定存活的最低成功数
-	TimeoutSecs  int      `yaml:"timeout_secs"`  // 单次探测超时（秒）
+	IntervalSecs     int      `yaml:"interval_secs"`      // 探测间隔（秒）
+	DestIPs          []string `yaml:"dest_ips"`           // 探测目的IP列表
+	ProbeProtocol    string   `yaml:"probe_protocol"`     // 探测协议: tcp/udp/icmp
+	ProbePort        int      `yaml:"probe_port"`         // 探测端口（tcp/udp 使用）
+	CNProbeISPs      []string `yaml:"cn_probe_isps"`      // 强制走大陆域名组的 ISP 名称
+	IntlProbeISPs    []string `yaml:"intl_probe_isps"`    // 强制走海外域名组的 ISP 名称
+	CNProbeDomains   []string `yaml:"cn_probe_domains"`   // 大陆域名组
+	IntlProbeDomains []string `yaml:"intl_probe_domains"` // 海外域名组
+	MinAlive         int      `yaml:"min_alive"`          // 判定存活的最低成功数
+	TimeoutSecs      int      `yaml:"timeout_secs"`       // 单次探测超时（秒）
 }
 
 type Config struct {
@@ -423,11 +429,10 @@ func isPrivateIP(cidr string) bool {
 
 // ================= 故障探测与默认路由切换 =================
 
-// probeDestIP: 用 TCP 拨测探测目的IP是否可达（从指定 src_ip 出口）
-// port 为 0 时退化为 TCP connect 到 80 端口（ICMP 需 root 权限，TCP 更通用）
-func probeDestIP(srcIP, destIP string, port, timeoutSecs int) bool {
+// probeDestTCP: 用 TCP 拨测探测目的IP是否可达（从指定 src_ip 出口）
+func probeDestTCP(srcIP, destIP string, port, timeoutSecs int) bool {
 	if port <= 0 {
-		port = 80
+		return false
 	}
 	timeout := time.Duration(timeoutSecs) * time.Second
 	addr := fmt.Sprintf("%s:%d", destIP, port)
@@ -449,15 +454,185 @@ func probeDestIP(srcIP, destIP string, port, timeoutSecs int) bool {
 	return true
 }
 
+// buildDNSQuery: 构造最小 DNS 查询报文（A 记录）
+func buildDNSQuery(domain string, txid uint16) []byte {
+	msg := make([]byte, 0, 64)
+	// Header
+	msg = append(msg,
+		byte(txid>>8), byte(txid), // ID
+		0x01, 0x00, // Flags: standard query, RD=1
+		0x00, 0x01, // QDCOUNT=1
+		0x00, 0x00, // ANCOUNT
+		0x00, 0x00, // NSCOUNT
+		0x00, 0x00, // ARCOUNT
+	)
+
+	parts := strings.Split(strings.Trim(domain, "."), ".")
+	for _, p := range parts {
+		if p == "" || len(p) > 63 {
+			continue
+		}
+		msg = append(msg, byte(len(p)))
+		msg = append(msg, []byte(p)...)
+	}
+	msg = append(msg, 0x00)       // end of QNAME
+	msg = append(msg, 0x00, 0x01) // QTYPE=A
+	msg = append(msg, 0x00, 0x01) // QCLASS=IN
+
+	return msg
+}
+
+// probeDestUDP: 用 UDP 探测目的IP端口可达性；53 端口使用 DNS 查询提高有效性
+func probeDestUDP(srcIP, destIP string, port, timeoutSecs int) bool {
+	if port <= 0 {
+		return false
+	}
+	timeout := time.Duration(timeoutSecs) * time.Second
+	if timeout <= 0 {
+		timeout = time.Duration(DEFAULT_PROBE_TIMEOUT) * time.Second
+	}
+
+	var localAddr *net.UDPAddr
+	if srcIP != "" {
+		ip := net.ParseIP(srcIP)
+		if ip == nil {
+			return false
+		}
+		localAddr = &net.UDPAddr{IP: ip, Port: 0}
+	}
+
+	dialer := net.Dialer{LocalAddr: localAddr, Timeout: timeout}
+	conn, err := dialer.Dial("udp4", fmt.Sprintf("%s:%d", destIP, port))
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	var payload []byte
+	var txid uint16
+	if port == 53 {
+		txid = uint16(rand.Intn(65536))
+		payload = buildDNSQuery("www.example.com", txid)
+	} else {
+		payload = []byte("netrt-udp-probe")
+	}
+
+	if _, err := conn.Write(payload); err != nil {
+		return false
+	}
+
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil || n <= 0 {
+		return false
+	}
+
+	// 对 DNS 响应做最小校验：返回包长度足够且事务 ID 匹配
+	if port == 53 {
+		if n < 12 {
+			return false
+		}
+		respID := uint16(buf[0])<<8 | uint16(buf[1])
+		return respID == txid
+	}
+
+	return true
+}
+
+// probeDestICMP: 用系统 ping 执行 ICMP 探测（从指定 src_ip 出口）
+func probeDestICMP(srcIP, destIP string, timeoutSecs int) bool {
+	if timeoutSecs <= 0 {
+		timeoutSecs = DEFAULT_PROBE_TIMEOUT
+	}
+
+	args := []string{"-c", "1", "-W", strconv.Itoa(timeoutSecs)}
+	if srcIP != "" {
+		args = append(args, "-I", srcIP)
+	}
+	args = append(args, destIP)
+
+	return exec.Command("ping", args...).Run() == nil
+}
+
+// probeDestIP: 按协议执行探测
+func probeDestIP(srcIP, destIP, protocol string, port, timeoutSecs int) bool {
+	switch strings.ToLower(protocol) {
+	case "icmp":
+		return probeDestICMP(srcIP, destIP, timeoutSecs)
+	case "udp":
+		return probeDestUDP(srcIP, destIP, port, timeoutSecs)
+	default:
+		return probeDestTCP(srcIP, destIP, port, timeoutSecs)
+	}
+}
+
 // probeISP: 从 isp.SrcIP 出口探测 destIPs，返回成功探测数
-func probeISP(isp ISPConfig, destIPs []string, port, timeoutSecs int) int {
+func probeISP(isp ISPConfig, destIPs []string, protocol string, port, timeoutSecs int) int {
 	alive := 0
 	for _, dest := range destIPs {
-		if probeDestIP(isp.SrcIP, dest, port, timeoutSecs) {
+		if probeDestIP(isp.SrcIP, dest, protocol, port, timeoutSecs) {
 			alive++
 		}
 	}
 	return alive
+}
+
+// buildISPGroupMap: 根据 ISP 名称构造分组映射，支持大小写无关匹配
+func buildISPGroupMap(cnISPs, intlISPs []string) map[string]string {
+	out := make(map[string]string)
+	for _, n := range cnISPs {
+		k := strings.ToLower(strings.TrimSpace(n))
+		if k != "" {
+			out[k] = "cn"
+		}
+	}
+	for _, n := range intlISPs {
+		k := strings.ToLower(strings.TrimSpace(n))
+		if k != "" {
+			out[k] = "intl"
+		}
+	}
+	return out
+}
+
+// resolveDomainsToIPv4: 将域名列表解析为去重后的 IPv4 列表
+func resolveDomainsToIPv4(domains []string, timeoutSecs int) []string {
+	if timeoutSecs <= 0 {
+		timeoutSecs = DEFAULT_PROBE_TIMEOUT
+	}
+	resolver := net.Resolver{}
+	seen := make(map[string]bool)
+	var out []string
+
+	for _, d := range domains {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+		addrs, err := resolver.LookupIPAddr(ctx, d)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		for _, a := range addrs {
+			v4 := a.IP.To4()
+			if v4 == nil {
+				continue
+			}
+			s := v4.String()
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+
+	return out
 }
 
 // replaceDefaultGateway: 替换主路由表默认路由
@@ -521,8 +696,22 @@ func runDetectLoop() {
 		if dc.IntervalSecs <= 0 {
 			dc.IntervalSecs = DEFAULT_DETECT_INTERVAL
 		}
-		if dc.ProbePort <= 0 {
-			dc.ProbePort = DEFAULT_PROBE_PORT
+		probeProtocol := strings.ToLower(strings.TrimSpace(dc.ProbeProtocol))
+		if probeProtocol == "" {
+			probeProtocol = "tcp"
+		}
+		switch probeProtocol {
+		case "icmp":
+			dc.ProbePort = 0
+		case "udp", "tcp":
+			if dc.ProbePort <= 0 {
+				dc.ProbePort = DEFAULT_PROBE_PORT
+			}
+		default:
+			probeProtocol = "tcp"
+			if dc.ProbePort <= 0 {
+				dc.ProbePort = DEFAULT_PROBE_PORT
+			}
 		}
 		if dc.MinAlive <= 0 {
 			dc.MinAlive = DEFAULT_MIN_ALIVE
@@ -530,7 +719,10 @@ func runDetectLoop() {
 		if dc.TimeoutSecs <= 0 {
 			dc.TimeoutSecs = DEFAULT_PROBE_TIMEOUT
 		}
-		if len(dc.DestIPs) == 0 {
+		hasDomainGroups := probeProtocol == "tcp" &&
+			(len(dc.CNProbeDomains) > 0 || len(dc.IntlProbeDomains) > 0) &&
+			(len(dc.CNProbeISPs) > 0 || len(dc.IntlProbeISPs) > 0)
+		if len(dc.DestIPs) == 0 && !hasDomainGroups {
 			// 无探测目标，跳过本轮
 			time.Sleep(time.Duration(dc.IntervalSecs) * time.Second)
 			continue
@@ -549,7 +741,19 @@ func runDetectLoop() {
 			defer logF.Close()
 		}
 
-		logger("=== 故障探测开始 (dest: %v) ===\n", dc.DestIPs)
+		probeMode := "ICMP"
+		if probeProtocol != "icmp" {
+			probeMode = fmt.Sprintf("%s:%d", strings.ToUpper(probeProtocol), dc.ProbePort)
+		}
+		logger("=== 故障探测开始 (mode:%s dest:%v) ===\n", probeMode, dc.DestIPs)
+
+		ispGroupMap := buildISPGroupMap(dc.CNProbeISPs, dc.IntlProbeISPs)
+		cnTargets := resolveDomainsToIPv4(dc.CNProbeDomains, dc.TimeoutSecs)
+		intlTargets := resolveDomainsToIPv4(dc.IntlProbeDomains, dc.TimeoutSecs)
+		if probeProtocol == "tcp" && len(ispGroupMap) > 0 {
+			logger("[探测] TCP域名分组已启用 (cn_isps:%d, intl_isps:%d, cn_domains:%d -> %dIP, intl_domains:%d -> %dIP)\n",
+				len(dc.CNProbeISPs), len(dc.IntlProbeISPs), len(dc.CNProbeDomains), len(cnTargets), len(dc.IntlProbeDomains), len(intlTargets))
+		}
 
 		// 获取当前默认网关
 		currentDefaultGW := getDefaultGateway()
@@ -577,9 +781,29 @@ func runDetectLoop() {
 				}
 				isp.SrcIP = localIP
 			}
-			aliveCount := probeISP(isp, dc.DestIPs, dc.ProbePort, dc.TimeoutSecs)
+			probeTargets := dc.DestIPs
+			if probeProtocol == "tcp" && len(ispGroupMap) > 0 {
+				group := ispGroupMap[strings.ToLower(strings.TrimSpace(isp.Name))]
+				switch group {
+				case "cn":
+					if len(cnTargets) > 0 {
+						probeTargets = cnTargets
+					}
+				case "intl":
+					if len(intlTargets) > 0 {
+						probeTargets = intlTargets
+					}
+				}
+			}
+
+			if len(probeTargets) == 0 {
+				logger("[探测] %s (src:%s gw:%s) 无可用探测目标，跳过\n", isp.Name, isp.SrcIP, isp.Gateway)
+				continue
+			}
+
+			aliveCount := probeISP(isp, probeTargets, probeProtocol, dc.ProbePort, dc.TimeoutSecs)
 			logger("[探测] %s (src:%s gw:%s) 存活探测: %d/%d\n",
-				isp.Name, isp.SrcIP, isp.Gateway, aliveCount, len(dc.DestIPs))
+				isp.Name, isp.SrcIP, isp.Gateway, aliveCount, len(probeTargets))
 
 			isDefault := defaultISP != nil && isp.Name == defaultISP.Name
 

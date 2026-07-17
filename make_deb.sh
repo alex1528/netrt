@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.0.6"
+VERSION="1.0.7"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_v${VERSION}_${ARCH}"
 
@@ -47,8 +47,22 @@ detect:
     - "180.76.76.76"
     - "8.8.8.8"
     - "8.8.4.4"
-  # 探测端口（TCP），0 表示用 ICMP ping
+  # 探测协议：tcp / udp / icmp
+  probe_protocol: "udp"
+  # 探测端口（tcp/udp 使用）
   probe_port: 53
+  # tcp 分组探测（可选）：按 ISP 名称强制分组，不再依赖 CIDR 判定
+  cn_probe_isps:
+    - "ctc"
+    - "cmc"
+  intl_probe_isps:
+    - "defaultrt"
+  cn_probe_domains:
+    - "dns.alidns.com"
+    - "doh.pub"
+  intl_probe_domains:
+    - "one.one.one.one"
+    - "dns.google"
   # 判定出口存活的最低成功探测数（dest_ips 中至少几个通）
   min_alive: 1
   # 探测超时（秒）

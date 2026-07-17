@@ -25,7 +25,19 @@ detect:
     - "119.29.29.29"
     - "223.5.5.5"
     - "8.8.8.8"
+  probe_protocol: "udp"  # tcp / udp / icmp
   probe_port: 53
+  cn_probe_isps:          # 仅 tcp 生效：强制走大陆域名组的 ISP 名称
+    - "ctc"
+    - "cmc"
+  intl_probe_isps:        # 仅 tcp 生效：强制走海外域名组的 ISP 名称
+    - "defaultrt"
+  cn_probe_domains:       # 仅 tcp 生效：大陆域名组
+    - "dns.alidns.com"
+    - "doh.pub"
+  intl_probe_domains:     # 仅 tcp 生效：海外域名组
+    - "one.one.one.one"
+    - "dns.google"
   min_alive: 1
   timeout_secs: 3
 
