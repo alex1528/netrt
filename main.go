@@ -215,12 +215,6 @@ func runTask() {
 	// 用于跟踪已同步到主表的 CIDR，避免多 ISP 重复写入
 	mainTableSynced := make(map[string]bool)
 	for _, isp := range conf.ISPs {
-		// 当 defaultrt 的网关与系统默认网关一致时，无需添加静态路由表项
-		if isp.Table == "defaultrt" && isp.Gateway == systemDefaultGW {
-			logger("[ISP] %s 网关 %s 与系统默认网关一致，跳过\n", isp.Name, isp.Gateway)
-			continue
-		}
-
 		logger("[ISP] 正在同步：%s\n", isp.Name)
 
 		// A. 自动管理路由表 ID (注册到 /etc/iproute2/rt_tables)
@@ -245,11 +239,24 @@ func runTask() {
 			continue
 		}
 
+		// defaultrt 不应绑定任何 from src_ip 的策略 rule，先清理历史残留
+		if isp.Table == "defaultrt" {
+			cleanupSrcRulesExceptTable(isp.SrcIP, "", logger)
+		}
+
 		if boundTable, exists := srcIPBinding[isp.SrcIP]; exists && boundTable != isp.Table {
+			// 同源冲突时，清理该 src_ip 绑定到冲突表的历史残留，只保留已绑定表
+			cleanupSrcRulesExceptTable(isp.SrcIP, boundTable, logger)
 			logger(" [冲突] src_ip %s 已绑定表 %s，拒绝再次绑定到 %s（ISP:%s），已跳过\n", isp.SrcIP, boundTable, isp.Table, isp.Name)
 			continue
 		}
 		srcIPBinding[isp.SrcIP] = isp.Table
+
+		// 当 defaultrt 的网关与系统默认网关一致时，无需维护策略 rule，且应清理该 src_ip 的历史绑定
+		if isp.Table == "defaultrt" && isp.Gateway == systemDefaultGW {
+			logger("[ISP] %s 网关 %s 与系统默认网关一致，已清理 src_ip 的策略规则并跳过\n", isp.Name, isp.Gateway)
+			continue
+		}
 
 		// C. 备份当前路由表 (升级保护)
 		backupPath := fmt.Sprintf("/tmp/rt_bak_%s.txt", isp.Table)
@@ -264,7 +271,10 @@ func runTask() {
 			ensureTableDefaultRoute(isp.Gateway, device, isp.SrcIP, isp.Table)
 		}
 
-		// E. 【优化】强制同步策略规则 (ip rule) - 先删除重复项再添加
+		// E. 强制同步策略规则：先清理同 src_ip 绑定到其它表的历史规则，再维护当前表规则
+		if isp.SrcIP != "" {
+			cleanupSrcRulesExceptTable(isp.SrcIP, isp.Table, logger)
+		}
 		if isp.SrcIP != "" && isp.Table != "defaultrt" {
 			ensureIpRuleClean(isp.SrcIP, isp.Table, logger)
 		}
@@ -444,6 +454,58 @@ func ensureIpRuleClean(srcIP, tableName string, logger func(string, ...interface
 
 	if deletedCount != deleteTimes {
 		logger(" [警告] 预期清理 %d 条，实际清理 %d 条，请检查规则状态\n", deleteTimes, deletedCount)
+	}
+}
+
+// cleanupSrcRulesExceptTable: 清理某 src_ip 绑定到非目标表的策略规则
+// keepTable 为空时，表示清理该 src_ip 的所有策略规则。
+func cleanupSrcRulesExceptTable(srcIP, keepTable string, logger func(string, ...interface{})) {
+	if strings.TrimSpace(srcIP) == "" {
+		return
+	}
+
+	out, err := exec.Command("ip", "rule", "show").Output()
+	if err != nil {
+		logger(" [警告] 无法获取当前 rule 列表用于冲突清理：%v\n", err)
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	srcPattern := fmt.Sprintf("from %s ", srcIP)
+	deleted := 0
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, srcPattern) {
+			continue
+		}
+
+		table := ""
+		if idx := strings.Index(line, " lookup "); idx >= 0 {
+			table = strings.Fields(line[idx+8:])[0]
+		} else if idx := strings.Index(line, " table "); idx >= 0 {
+			table = strings.Fields(line[idx+7:])[0]
+		}
+
+		if table == "" {
+			continue
+		}
+		if keepTable != "" && table == keepTable {
+			continue
+		}
+
+		if err := exec.Command("ip", "rule", "del", "from", srcIP, "table", table).Run(); err == nil {
+			deleted++
+			logger(" [清理] 删除冲突 rule: %s\n", line)
+		}
+	}
+
+	if deleted > 0 {
+		if keepTable == "" {
+			logger(" [完成] 已清理 src_ip %s 的全部策略 rule（%d 条）\n", srcIP, deleted)
+		} else {
+			logger(" [完成] 已清理 src_ip %s 非表 %s 的冲突 rule（%d 条）\n", srcIP, keepTable, deleted)
+		}
 	}
 }
 
