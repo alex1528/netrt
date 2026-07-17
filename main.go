@@ -226,8 +226,19 @@ func runTask() {
 		// B. 探测网卡信息 (自动识别私网/公网网卡)
 		localIP, device, err := findInterfaceInfo(isp.Gateway)
 		if err != nil {
-			logger(" [警告] 无法为网关 %s 探测接口：%v\n", isp.Gateway, err)
-			continue
+			if isp.SrcIP != "" {
+				if devBySrc, derr := findInterfaceBySrcIP(isp.SrcIP); derr == nil {
+					localIP = isp.SrcIP
+					device = devBySrc
+					logger(" [提示] 网关探测失败，已通过 src_ip=%s 反查网卡 %s 继续\n", isp.SrcIP, device)
+				} else {
+					logger(" [警告] 无法为网关 %s 探测接口：%v，且 src_ip 兜底失败：%v\n", isp.Gateway, err, derr)
+					continue
+				}
+			} else {
+				logger(" [警告] 无法为网关 %s 探测接口：%v\n", isp.Gateway, err)
+				continue
+			}
 		}
 		if isp.SrcIP == "" {
 			isp.SrcIP = localIP
@@ -365,9 +376,16 @@ func checkGatewayRange(gatewayStr string) (string, string, bool) {
 
 // findInterfaceInfo: 通过内核路由表自动锁定出口 IP 和设备（支持私有地址网关）
 func findInterfaceInfo(gatewayStr string) (string, string, error) {
-	out, err := exec.Command("ip", "route", "get", gatewayStr).Output()
+	out, err := exec.Command("ip", "route", "get", gatewayStr).CombinedOutput()
 	if err != nil {
-		return "", "", err
+		if localIP, dev, ok := checkGatewayRange(gatewayStr); ok {
+			return localIP, dev, nil
+		}
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("%v: %s", err, msg)
 	}
 	fields := strings.Fields(string(out))
 	var localIP, device string
@@ -383,6 +401,40 @@ func findInterfaceInfo(gatewayStr string) (string, string, error) {
 		return "", "", fmt.Errorf("解析地址失败")
 	}
 	return localIP, device, nil
+}
+
+// findInterfaceBySrcIP: 通过显式 src_ip 反查网卡名（用于 route get 失败时兜底）
+func findInterfaceBySrcIP(srcIP string) (string, error) {
+	needle := strings.TrimSpace(srcIP)
+	if needle == "" {
+		return "", fmt.Errorf("src_ip 为空")
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.To4() == nil {
+				continue
+			}
+			if ipNet.IP.String() == needle {
+				return iface.Name, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("未找到 src_ip %s 对应网卡", srcIP)
 }
 
 // ensureTableDefaultRoute: 强制同步表内默认路由
@@ -885,6 +937,11 @@ func runDetectLoop() {
 					continue
 				}
 				isp.SrcIP = localIP
+			} else {
+				if _, err := findInterfaceBySrcIP(isp.SrcIP); err != nil {
+					logger("[探测] %s (src:%s gw:%s) src_ip 无法匹配本机网卡，跳过\n", isp.Name, isp.SrcIP, isp.Gateway)
+					continue
+				}
 			}
 			probeTargets := dc.DestIPs
 			if probeProtocol == "tcp" && len(ispGroupMap) > 0 {
