@@ -209,6 +209,8 @@ func runTask() {
 	// 2. 处理各 ISP (包含私网和公网)
 	// 获取系统当前默认网关，用于判断是否跳过 defaultrt
 	systemDefaultGW := getDefaultGateway()
+	// 硬约束：同一 src_ip 仅允许绑定 1 个策略表
+	srcIPBinding := make(map[string]string)
 
 	// 用于跟踪已同步到主表的 CIDR，避免多 ISP 重复写入
 	mainTableSynced := make(map[string]bool)
@@ -235,7 +237,19 @@ func runTask() {
 		}
 		if isp.SrcIP == "" {
 			isp.SrcIP = localIP
+			logger(" [提示] %s 未显式配置 src_ip，自动探测为 %s\n", isp.Name, isp.SrcIP)
 		}
+
+		if isp.SrcIP == "" {
+			logger(" [警告] %s 的 src_ip 为空，跳过该 ISP\n", isp.Name)
+			continue
+		}
+
+		if boundTable, exists := srcIPBinding[isp.SrcIP]; exists && boundTable != isp.Table {
+			logger(" [冲突] src_ip %s 已绑定表 %s，拒绝再次绑定到 %s（ISP:%s），已跳过\n", isp.SrcIP, boundTable, isp.Table, isp.Name)
+			continue
+		}
+		srcIPBinding[isp.SrcIP] = isp.Table
 
 		// C. 备份当前路由表 (升级保护)
 		backupPath := fmt.Sprintf("/tmp/rt_bak_%s.txt", isp.Table)
@@ -366,41 +380,70 @@ func ensureTableDefaultRoute(gw, dev, src, table string) {
 	exec.Command("ip", "route", "replace", "default", "via", gw, "dev", dev, "src", src, "table", table).Run()
 }
 
-// ensureIpRuleClean: 【优化版】清理重复规则后添加唯一策略规则
-// 先删除所有匹配的规则，再添加一条新规则，确保唯一性
+// ensureIpRuleClean: 幂等维护策略规则
+// - 无规则时添加 1 条
+// - 多于 1 条时仅删除多余项
+// - 恰好 1 条时保持不变
 func ensureIpRuleClean(srcIP, tableName string, logger func(string, ...interface{})) {
-	// 步骤 1: 获取当前所有 rule
 	out, err := exec.Command("ip", "rule", "show").Output()
 	if err != nil {
 		logger(" [警告] 无法获取当前 rule 列表：%v\n", err)
 		return
 	}
 
-	// 步骤 2: 查找并删除所有匹配的规则 (from SRCIP lookup TABLE)
 	lines := strings.Split(string(out), "\n")
-	targetPattern := fmt.Sprintf("from %s lookup %s", srcIP, tableName)
+	targetLookupPattern := fmt.Sprintf("from %s lookup %s", srcIP, tableName)
+	targetTablePattern := fmt.Sprintf("from %s table %s", srcIP, tableName)
+	srcPattern := fmt.Sprintf("from %s ", srcIP)
 
-	deletedCount := 0
+	exactCount := 0
+	var otherTableLines []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// 检查是否包含目标规则 (忽略优先级数字)
-		if strings.Contains(line, targetPattern) {
-			exec.Command("ip", "rule", "del", "from", srcIP, "table", tableName).Run()
-			deletedCount++
-			logger(" [清理] 删除重复 rule: %s\n", line)
+
+		if strings.Contains(line, targetLookupPattern) || strings.Contains(line, targetTablePattern) {
+			exactCount++
+			continue
+		}
+
+		// 同一个源地址若绑定到了其它 table，提示冲突风险
+		if strings.Contains(line, srcPattern) && (strings.Contains(line, " lookup ") || strings.Contains(line, " table ")) {
+			otherTableLines = append(otherTableLines, line)
 		}
 	}
 
-	// 步骤 3: 添加唯一的新规则
-	exec.Command("ip", "rule", "add", "from", srcIP, "table", tableName).Run()
+	if len(otherTableLines) > 0 {
+		logger(" [提示] 源地址 %s 同时命中其它策略表，可能存在规则冲突（当前目标表 %s）\n", srcIP, tableName)
+		for _, l := range otherTableLines {
+			logger(" [提示]   其它 rule: %s\n", l)
+		}
+	}
 
-	if deletedCount > 0 {
-		logger(" [完成] 已清理 %d 条重复 rule，添加新规则 from %s lookup %s\n", deletedCount, srcIP, tableName)
-	} else {
+	if exactCount == 0 {
+		exec.Command("ip", "rule", "add", "from", srcIP, "table", tableName).Run()
 		logger(" [完成] 添加 rule: from %s lookup %s\n", srcIP, tableName)
+		return
+	}
+
+	if exactCount == 1 {
+		logger(" [完成] rule 已存在且唯一: from %s lookup %s\n", srcIP, tableName)
+		return
+	}
+
+	deleteTimes := exactCount - 1
+	deletedCount := 0
+	for i := 0; i < deleteTimes; i++ {
+		if err := exec.Command("ip", "rule", "del", "from", srcIP, "table", tableName).Run(); err == nil {
+			deletedCount++
+		}
+	}
+	logger(" [完成] 已清理 %d 条重复 rule，保留 1 条 from %s lookup %s\n", deletedCount, srcIP, tableName)
+
+	if deletedCount != deleteTimes {
+		logger(" [警告] 预期清理 %d 条，实际清理 %d 条，请检查规则状态\n", deleteTimes, deletedCount)
 	}
 }
 

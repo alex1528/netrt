@@ -12,6 +12,7 @@
 - 路由看门狗：周期检查路由缺失并触发重同步
 - `rt_tables` 自愈：缺失时自动初始化 `/etc/iproute2/rt_tables`
 - 特殊目标路由开关：`special_targets_enabled` 默认关闭
+- 策略规则硬约束：同步阶段同一 `src_ip` 只允许绑定一个 `table`，冲突会告警并跳过
 
 ## 配置文件
 
@@ -64,9 +65,12 @@ isps:
   - name: "ctc"
     gateway: "2.2.2.2"
     table: "ctc"
+    src_ip: "2.2.2.100"  # 建议显式固定，避免自动探测冲突
     remote_url: "http://example.com/telecom.rsc"
     sync_to_main: true
 ```
+
+说明：若某个 ISP 未配置 `src_ip`，程序会自动探测；但为避免多 ISP 收敛到同一源地址，建议生产环境为每个 ISP 显式固定 `src_ip`。
 
 ## 依赖
 

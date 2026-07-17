@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.0.7"
+VERSION="1.0.8"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_v${VERSION}_${ARCH}"
 
@@ -91,24 +91,28 @@ isps:
   - name: "ctc"
     gateway: "2.2.2.2"
     table: "ctc"
+    src_ip: "2.2.2.100"   # 建议显式固定，避免多 ISP 自动探测收敛到同一 src_ip
     remote_url: "http://ros.tcp5.com/list/telecom_latest.rsc"
     sync_to_main: true
 
   - name: "cuc"
     gateway: "3.3.3.3"
     table: "cuc"
+    src_ip: "3.3.3.100"   # 建议显式固定
     remote_url: "http://ros.tcp5.com/list/unicom_latest.rsc"
     sync_to_main: true
 
   - name: "cmc"
     gateway: "4.4.4.4"
     table: "cmc"
+    src_ip: "4.4.4.100"   # 建议显式固定
     remote_url: "http://ros.tcp5.com/list/mobile_latest.rsc"
     sync_to_main: true
 
   - name: "cnt"
     gateway: "5.5.5.5"
     table: "cnt"
+    src_ip: "5.5.5.100"   # 建议显式固定
     remote_url: "http://ros.tcp5.com/list/cernet_latest.rsc"
     sync_to_main: true
 
