@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.1.1"
+VERSION="1.1.2"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_v${VERSION}_${ARCH}"
 
@@ -75,12 +75,35 @@ sync:
   interval_hours: 1    # 同步间隔小时数 (原 SYNC_INTERVAL_HOURS)
   jitter_secs: 600     # 随机抖动范围秒数 (原 RANDOM_JITTER_SECS)
 
-# ==== 特殊目标路由 ====
-special_targets_enabled: false
-gateway: "1.1.1.1"
-targets:
-  - "11.11.11.11"
-  - "12.12.12.0/24"
+# ================= 多组特殊目标路由（新版配置） =================
+# 每组支持静态 targets 与远程 targets_url（可共存，自动合并去重）
+# targets_url 支持 Linux route-add 与 MikroTik 地址列表两种格式，下载失败自动降级本地缓存
+special_target_routes:
+  - name: "group01"
+    enabled: true
+    gateway: "36.154.11.65"
+    targets:
+      - "36.154.11.153"
+    # targets_url: "http://example.com/list/group01.rsc"
+  - name: "group02"
+    enabled: true
+    gateway: "112.82.212.161"
+    targets:
+      - "112.82.241.55"
+    # targets_url: "http://example.com/list/group02.rsc"
+  - name: "group03"
+    enabled: true
+    gateway: "61.160.245.65"
+    targets:
+      - "61.160.249.55"
+    # targets_url: "http://example.com/list/group03.rsc"
+
+# ================= 旧版单组特殊路由（已废弃，建议使用 special_target_routes） =================
+# special_targets_enabled: false
+# gateway: "1.1.1.1"
+# targets:
+#   - "11.11.11.11"
+#   - "12.12.12.0/24"
 
 # ================= 多线ISP配置 =================
 isps:
@@ -157,7 +180,8 @@ cat <<'EOF' > "$PKG_DIR/usr/share/doc/netrt/README.md"
 本工具支持从远程 URL 自动获取并更新路由，兼容以下内容格式：
 
 ### 1. 传统 Linux 格式
-`route add -net 223.252.221.0/24 gw DESTGW`
+`route add -net 223.252.221.0/24 gw DESTGW`（网段）
+`route add -host 1.2.3.4 gw DESTGW`（单主机，自动补 /32）
 
 ### 2. MikroTik 地址池格式
 `add address=223.252.214.0/23 list=List_ChinaTelecom`

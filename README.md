@@ -11,7 +11,7 @@
 - 默认网关智能跳过：ISP 网关等于系统默认网关时，不写冗余主表静态路由
 - 路由看门狗：周期检查路由缺失并触发重同步
 - `rt_tables` 自愈：缺失时自动初始化 `/etc/iproute2/rt_tables`
-- 特殊目标路由开关：`special_targets_enabled` 默认关闭
+- 多组特殊目标路由：支持配置多个独立的特殊路由组，每组独立开关，`targets` 静态列表与 `targets_url` 远程列表可共存（自动合并去重、重试与缓存降级）
 - 策略规则硬约束：同步阶段同一 `src_ip` 只允许绑定一个 `table`，冲突会告警并跳过
 
 ## 配置文件
@@ -48,12 +48,25 @@ sync:
   interval_hours: 1
   jitter_secs: 600
 
-# ================= 全局特殊路由 =================
-special_targets_enabled: false
-gateway: "1.1.1.1"
-targets:
-  - "11.11.11.11"
-  - "12.12.12.0/24"
+# ================= 多组特殊目标路由 =================
+# 每组支持静态 targets 与远程 targets_url（可共存，自动合并去重）
+# targets_url 支持 Linux route-add 与 MikroTik 地址列表格式，下载失败自动降级本地缓存
+special_target_routes:
+  - name: "group01"
+    enabled: true
+    gateway: "36.154.11.65"
+    targets:
+      - "36.154.11.153"
+    targets_url: "http://example.com/list/group01.rsc"
+  - name: "group02"
+    enabled: true
+    gateway: "112.82.212.161"
+    targets:
+      - "112.82.241.55"
+  - name: "group03"
+    enabled: true
+    gateway: "61.160.245.65"
+    targets_url: "http://example.com/list/group03.rsc"
 
 # ================= 多线 ISP 配置 =================
 isps:

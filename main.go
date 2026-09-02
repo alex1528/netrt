@@ -57,26 +57,38 @@ type SyncConfig struct {
 
 // DetectConfig 对应 config.yaml 中的 detect 节
 type DetectConfig struct {
-	IntervalSecs     int      `yaml:"interval_secs"`      // 探测间隔（秒）
-	DestIPs          []string `yaml:"dest_ips"`           // 探测目的IP列表
-	ProbeProtocol    string   `yaml:"probe_protocol"`     // 探测协议: tcp/udp/icmp
-	RouteSwitchEnabled *bool   `yaml:"route_switch_enabled"` // 默认网关及路由切换开关（未配置默认启用）
-	ProbePort        int      `yaml:"probe_port"`         // 探测端口（tcp/udp 使用）
-	CNProbeISPs      []string `yaml:"cn_probe_isps"`      // 强制走大陆域名组的 ISP 名称
-	IntlProbeISPs    []string `yaml:"intl_probe_isps"`    // 强制走海外域名组的 ISP 名称
-	CNProbeDomains   []string `yaml:"cn_probe_domains"`   // 大陆域名组
-	IntlProbeDomains []string `yaml:"intl_probe_domains"` // 海外域名组
-	MinAlive         int      `yaml:"min_alive"`          // 判定存活的最低成功数
-	TimeoutSecs      int      `yaml:"timeout_secs"`       // 单次探测超时（秒）
+	IntervalSecs       int      `yaml:"interval_secs"`        // 探测间隔（秒）
+	DestIPs            []string `yaml:"dest_ips"`             // 探测目的IP列表
+	ProbeProtocol      string   `yaml:"probe_protocol"`       // 探测协议: tcp/udp/icmp
+	RouteSwitchEnabled *bool    `yaml:"route_switch_enabled"` // 默认网关及路由切换开关（未配置默认启用）
+	ProbePort          int      `yaml:"probe_port"`           // 探测端口（tcp/udp 使用）
+	CNProbeISPs        []string `yaml:"cn_probe_isps"`        // 强制走大陆域名组的 ISP 名称
+	IntlProbeISPs      []string `yaml:"intl_probe_isps"`      // 强制走海外域名组的 ISP 名称
+	CNProbeDomains     []string `yaml:"cn_probe_domains"`     // 大陆域名组
+	IntlProbeDomains   []string `yaml:"intl_probe_domains"`   // 海外域名组
+	MinAlive           int      `yaml:"min_alive"`            // 判定存活的最低成功数
+	TimeoutSecs        int      `yaml:"timeout_secs"`         // 单次探测超时（秒）
+}
+
+// SpecialTargetRoute 单组特殊目标路由配置
+type SpecialTargetRoute struct {
+	Name       string   `yaml:"name"`        // 组名称（用于缓存标识，缺省为 special_<序号>）
+	Enabled    bool     `yaml:"enabled"`     // 该组是否启用
+	Gateway    string   `yaml:"gateway"`     // 网关地址
+	Targets    []string `yaml:"targets"`     // 静态目标 CIDR 列表
+	TargetsURL string   `yaml:"targets_url"` // 远程目标列表 URL（支持 Linux/RouterOS 格式，与 targets 可共存合并）
 }
 
 type Config struct {
-	SpecialTargetsEnabled bool         `yaml:"special_targets_enabled"`
-	Gateway               string       `yaml:"gateway"`
-	Targets               []string     `yaml:"targets"`
-	ISPs                  []ISPConfig  `yaml:"isps"`
-	Sync                  SyncConfig   `yaml:"sync"`
-	Detect                DetectConfig `yaml:"detect"`
+	// 兼容旧版单组配置（已废弃，建议使用 special_target_routes）
+	SpecialTargetsEnabled bool     `yaml:"special_targets_enabled"`
+	Gateway               string   `yaml:"gateway"`
+	Targets               []string `yaml:"targets"`
+	// 新版多组特殊目标路由
+	SpecialTargetRoutes []SpecialTargetRoute `yaml:"special_target_routes"`
+	ISPs                []ISPConfig          `yaml:"isps"`
+	Sync                SyncConfig           `yaml:"sync"`
+	Detect              DetectConfig         `yaml:"detect"`
 }
 
 // ================= 全局变量 =================
@@ -177,17 +189,87 @@ func runTask() {
 	// 重新加载最新配置
 	conf := loadConfig()
 
-	if len(conf.ISPs) == 0 && len(conf.Targets) == 0 {
+	if len(conf.ISPs) == 0 && len(conf.Targets) == 0 && len(conf.SpecialTargetRoutes) == 0 {
 		logger("[警告] 配置为空，跳过本次同步\n")
 		return
 	}
 
-	// 1. 处理基础全局路由 (带网关地址范围校验，支持私有地址)
+	// 1. 处理多组特殊目标路由（新版配置）
+	if len(conf.SpecialTargetRoutes) > 0 {
+		logger("[全局] 检测到 %d 组特殊目标路由配置\n", len(conf.SpecialTargetRoutes))
+		for idx, str := range conf.SpecialTargetRoutes {
+			groupName := strings.TrimSpace(str.Name)
+			if groupName == "" {
+				groupName = fmt.Sprintf("special_%d", idx+1)
+			}
+
+			if !str.Enabled {
+				logger("[全局] 特殊路由组 %s 未启用，跳过\n", groupName)
+				continue
+			}
+			if str.Gateway == "" || (len(str.Targets) == 0 && strings.TrimSpace(str.TargetsURL) == "") {
+				logger("[全局] 特殊路由组 %s 配置不完整（gateway 或 targets/targets_url 均为空），跳过\n", groupName)
+				continue
+			}
+
+			// 合并静态 targets 与远程 targets_url（远程失败时自动降级缓存）
+			targets := make([]string, 0, len(str.Targets))
+			targets = append(targets, str.Targets...)
+			if strings.TrimSpace(str.TargetsURL) != "" {
+				remoteTargets, err := fetchAndVerifyRoutes(str.TargetsURL, groupName)
+				if err != nil {
+					logger("[全局] 特殊路由组 %s 远程目标拉取失败：%v（仅使用静态 targets）\n", groupName, err)
+				} else {
+					targets = append(targets, remoteTargets...)
+				}
+			}
+
+			// 去重：相同 CIDR 只保留第一次出现
+			seen := make(map[string]bool, len(targets))
+			uniq := targets[:0]
+			for _, t := range targets {
+				normalized := normalizeCIDR(t)
+				if !seen[normalized] {
+					seen[normalized] = true
+					uniq = append(uniq, t)
+				}
+			}
+			targets = uniq
+
+			if len(targets) == 0 {
+				logger("[全局] 特殊路由组 %s 无可用目标（静态与远程均为空），跳过\n", groupName)
+				continue
+			}
+
+			// 检查网关是否可达
+			matchedIP, matchedDev, isInRange := checkGatewayRange(str.Gateway)
+			if isInRange {
+				logger("[全局] 特殊路由组 %s 网关匹配成功 (本机 IP:%s, 设备:%s), 正在同步 %d 条特殊路由\n", groupName, matchedIP, matchedDev, len(targets))
+				for _, target := range targets {
+					applyRoute(target, str.Gateway, "", matchedDev)
+				}
+			} else {
+				// 尝试通过路由表查找出口
+				localIP, device, err := findInterfaceInfo(str.Gateway)
+				if err == nil && localIP != "" && device != "" {
+					logger("[全局] 特殊路由组 %s 通过路由表匹配成功 (本机 IP:%s, 设备:%s), 正在同步 %d 条特殊路由\n", groupName, localIP, device, len(targets))
+					for _, target := range targets {
+						applyRoute(target, str.Gateway, "", device)
+					}
+				} else {
+					logger("[全局] 特殊路由组 %s 网关 %s 不在本机网卡地址范围内，跳过该组特殊路由\n", groupName, str.Gateway)
+				}
+			}
+		}
+	}
+
+	// 2. 兼容旧版单组特殊目标路由配置（已废弃）
 	if conf.SpecialTargetsEnabled && conf.Gateway != "" && len(conf.Targets) > 0 {
+		logger("[警告] 检测到旧版 special_targets_enabled 配置，建议迁移到 special_target_routes\n")
 		// 检查本机是否有网卡 IP 与 gateway 在同一网段（包含私有地址）
 		matchedIP, matchedDev, isInRange := checkGatewayRange(conf.Gateway)
 		if isInRange {
-			logger("[全局] 网关匹配成功 (本机 IP:%s, 设备:%s), 正在同步 %d 条特殊路由\n", matchedIP, matchedDev, len(conf.Targets))
+			logger("[全局] 旧版网关匹配成功 (本机 IP:%s, 设备:%s), 正在同步 %d 条特殊路由\n", matchedIP, matchedDev, len(conf.Targets))
 			for _, target := range conf.Targets {
 				applyRoute(target, conf.Gateway, "", matchedDev)
 			}
@@ -195,19 +277,19 @@ func runTask() {
 			// 尝试通过路由表查找出口（支持私有网关）
 			localIP, device, err := findInterfaceInfo(conf.Gateway)
 			if err == nil && localIP != "" && device != "" {
-				logger("[全局] 通过路由表匹配成功 (本机 IP:%s, 设备:%s), 正在同步 %d 条特殊路由\n", localIP, device, len(conf.Targets))
+				logger("[全局] 旧版通过路由表匹配成功 (本机 IP:%s, 设备:%s), 正在同步 %d 条特殊路由\n", localIP, device, len(conf.Targets))
 				for _, target := range conf.Targets {
 					applyRoute(target, conf.Gateway, "", device)
 				}
 			} else {
-				logger("[全局] 网关 %s 不在本机网卡地址范围内，跳过特殊路由规则\n", conf.Gateway)
+				logger("[全局] 旧版网关 %s 不在本机网卡地址范围内，跳过特殊路由规则\n", conf.Gateway)
 			}
 		}
 	} else if !conf.SpecialTargetsEnabled && len(conf.Targets) > 0 {
-		logger("[全局] 特殊目标路由开关未启用，跳过 %d 条目标\n", len(conf.Targets))
+		logger("[全局] 旧版特殊目标路由开关未启用，跳过 %d 条目标\n", len(conf.Targets))
 	}
 
-	// 2. 处理各 ISP (包含私网和公网)
+	// 3. 处理各 ISP (包含私网和公网)
 	// 获取系统当前默认网关，用于判断是否跳过 defaultrt
 	systemDefaultGW := getDefaultGateway()
 	// 硬约束：同一 src_ip 仅允许绑定 1 个策略表
@@ -1137,8 +1219,9 @@ func getCachePath(tableName string) string {
 }
 
 // fetchAndVerifyRoutes: 从远程获取内容并验证合法性（带重试和本地缓存降级）
-// 支持格式 1: route add -net 223.252.221.0/24 gw DESTGW
-// 支持格式 2: add address=223.252.214.0/23 comment="" list=List_ChinaTelecom
+// 支持格式 1: route add -net 223.252.221.0/24 gw DESTGW（网段）
+// 支持格式 2: route add -host 1.2.3.4 gw DESTGW（单主机，自动补 /32）
+// 支持格式 3: add address=223.252.214.0/23 comment="" list=List_ChinaTelecom
 func fetchAndVerifyRoutes(url string, tableName string) ([]string, error) {
 	// 确保缓存目录存在
 	os.MkdirAll(ROUTE_CACHE_DIR, 0755)
@@ -1203,11 +1286,11 @@ func parseRouteContent(text string) []string {
 
 		var candidate string
 
-		if strings.Contains(line, "route add -net") {
-			// 逻辑 A: Linux 格式
+		if strings.Contains(line, "route add -net") || strings.Contains(line, "route add -host") {
+			// 逻辑 A: Linux 格式（-net 网段路由 / -host 单主机路由，裸 IP 下游自动补 /32）
 			fields := strings.Fields(line)
 			for i, f := range fields {
-				if f == "-net" && i+1 < len(fields) {
+				if (f == "-net" || f == "-host") && i+1 < len(fields) {
 					candidate = fields[i+1]
 					break
 				}
