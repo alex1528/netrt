@@ -128,6 +128,17 @@ func main() {
 	fmt.Printf("配置路径：%s | 日志路径：%s\n", CONFIG, LOG_FILE)
 	fmt.Printf("同步间隔：%d 小时 (+0~%d 秒随机抖动)\n", syncHours, jitterSecs)
 
+	// 启动前预注册所有 ISP 路由表（含 rt_tables 自愈），
+	// 避免探测/看门狗 goroutine 先于首次 runTask 运行时表名尚未注册导致操作失败
+	for _, isp := range conf.ISPs {
+		if strings.TrimSpace(isp.Table) == "" {
+			continue
+		}
+		if err := ensureRtTable(isp.Table); err != nil {
+			fmt.Printf("[警告] 启动预注册路由表 %s 失败：%v\n", isp.Table, err)
+		}
+	}
+
 	// 启动独立的故障探测 goroutine（与路由同步并行运行）
 	go runDetectLoop()
 
@@ -541,6 +552,14 @@ func ensureIpRuleClean(srcIP, tableName string, logger func(string, ...interface
 	targetTablePattern := fmt.Sprintf("from %s table %s", srcIP, tableName)
 	srcPattern := fmt.Sprintf("from %s ", srcIP)
 
+	// 精简系统下 `ip rule show` 可能输出数字表 ID 而非表名，需同时匹配
+	tableID := resolveTableID(tableName)
+	targetLookupIDPattern, targetTableIDPattern := "", ""
+	if tableID != "" && tableID != tableName {
+		targetLookupIDPattern = fmt.Sprintf("from %s lookup %s", srcIP, tableID)
+		targetTableIDPattern = fmt.Sprintf("from %s table %s", srcIP, tableID)
+	}
+
 	exactCount := 0
 	var otherTableLines []string
 	for _, line := range lines {
@@ -549,7 +568,8 @@ func ensureIpRuleClean(srcIP, tableName string, logger func(string, ...interface
 			continue
 		}
 
-		if strings.Contains(line, targetLookupPattern) || strings.Contains(line, targetTablePattern) {
+		if strings.Contains(line, targetLookupPattern) || strings.Contains(line, targetTablePattern) ||
+			(targetLookupIDPattern != "" && (strings.Contains(line, targetLookupIDPattern) || strings.Contains(line, targetTableIDPattern))) {
 			exactCount++
 			continue
 		}
@@ -609,6 +629,9 @@ func cleanupSrcRulesExceptTable(srcIP, keepTable string, logger func(string, ...
 	srcPattern := fmt.Sprintf("from %s ", srcIP)
 	deleted := 0
 
+	// 精简系统下 `ip rule show` 可能输出数字表 ID，需将 keepTable 解析为数字 ID 一并比对
+	keepTableID := resolveTableID(keepTable)
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.Contains(line, srcPattern) {
@@ -625,7 +648,7 @@ func cleanupSrcRulesExceptTable(srcIP, keepTable string, logger func(string, ...
 		if table == "" {
 			continue
 		}
-		if keepTable != "" && table == keepTable {
+		if keepTable != "" && (table == keepTable || (keepTableID != "" && table == keepTableID)) {
 			continue
 		}
 
@@ -1327,6 +1350,36 @@ func normalizeCIDR(cidr string) string {
 		return cidr
 	}
 	return ipNet.String()
+}
+
+// resolveTableID: 从 /etc/iproute2/rt_tables 解析表名对应的数字 ID
+// 用于兼容精简系统：当名称映射缺失时，`ip rule show` 输出数字 ID 而非表名，
+// 规则匹配需同时比对名称与数字 ID。解析失败返回空字符串。
+func resolveTableID(tableName string) string {
+	tableName = strings.TrimSpace(tableName)
+	if tableName == "" {
+		return ""
+	}
+	// 本身已是数字则直接返回
+	if _, err := strconv.Atoi(tableName); err == nil {
+		return tableName
+	}
+
+	content, err := os.ReadFile(RT_TABLES)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == tableName {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 // ensureRtTable: 倒序分配 ID (252 往下)，注册到 /etc/iproute2/rt_tables
