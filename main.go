@@ -57,6 +57,7 @@ type SyncConfig struct {
 
 // DetectConfig 对应 config.yaml 中的 detect 节
 type DetectConfig struct {
+	Enabled            *bool    `yaml:"enabled"`              // 探测逻辑总开关（未配置默认启用）
 	IntervalSecs       int      `yaml:"interval_secs"`        // 探测间隔（秒）
 	DestIPs            []string `yaml:"dest_ips"`             // 探测目的IP列表
 	ProbeProtocol      string   `yaml:"probe_protocol"`       // 探测协议: tcp/udp/icmp
@@ -954,6 +955,21 @@ func runDetectLoop() {
 	for {
 		conf := loadConfig()
 		dc := conf.Detect
+
+		// 探测逻辑总开关：未配置或非 false 均视为启用；显式配置 enabled: false 时关闭探测
+		detectEnabled := true
+		if dc.Enabled != nil {
+			detectEnabled = *dc.Enabled
+		}
+		if !detectEnabled {
+			sleepSecs := dc.IntervalSecs
+			if sleepSecs <= 0 {
+				sleepSecs = DEFAULT_DETECT_INTERVAL
+			}
+			fmt.Println("[探测] 探测逻辑开关已关闭（detect.enabled=false），本轮跳过")
+			time.Sleep(time.Duration(sleepSecs) * time.Second)
+			continue
+		}
 
 		// 填充默认值
 		if dc.IntervalSecs <= 0 {

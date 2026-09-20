@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 APP_NAME="netrt"
-VERSION="1.1.3"
+VERSION="1.1.4"
 ARCH="amd64"
 PKG_DIR="${APP_NAME}_v${VERSION}_${ARCH}"
 
@@ -37,6 +37,8 @@ cat <<'EOF' > "$PKG_DIR/$CONF_TARGET"
 # ================= 全局路由配置 =================
 # ================= 故障探测配置 =================
 detect:
+  # 探测逻辑总开关（未配置默认启用；设为 false 时完全跳过探测与路由切换）
+  enabled: true
   # 探测间隔（秒）
   interval_secs: 180
   # 探测目的IP列表
@@ -224,6 +226,36 @@ cat <<'EOF' > "$PKG_DIR/DEBIAN/postinst"
 #!/bin/bash
 set -e
 CONF_FILE="/etc/netrt/config.yaml"
+TS=$(date +%Y%m%d%H%M%S)
+
+# ---------- 新配置文件安装逻辑 ----------
+# config.yaml 已登记为 conffile：升级时若旧配置被修改过，dpkg 默认保留旧文件，
+# 并把包内新版本放为 config.yaml.dpkg-dist。此处强制启用新配置，旧配置自动备份。
+install_new_conffile() {
+    local NEW=""
+    if [ -f "$CONF_FILE.dpkg-dist" ]; then
+        NEW="$CONF_FILE.dpkg-dist"
+    elif [ -f "$CONF_FILE.dpkg-new" ]; then
+        NEW="$CONF_FILE.dpkg-new"
+    fi
+
+    if [ -n "$NEW" ]; then
+        if [ -f "$CONF_FILE" ]; then
+            cp -a "$CONF_FILE" "$CONF_FILE.bak.$TS"
+            echo "[netrt] 旧配置已备份至 $CONF_FILE.bak.$TS"
+        fi
+        mv -f "$NEW" "$CONF_FILE"
+        chmod 644 "$CONF_FILE"
+        echo "[netrt] 已安装新版配置文件 $CONF_FILE"
+    fi
+
+    # 兜底：配置文件缺失时（被误删等），从包内模板恢复不可行，直接告警
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "[netrt] [错误] 配置文件 $CONF_FILE 不存在，请手动恢复（备份文件：$CONF_FILE.bak.*）"
+    fi
+}
+
+install_new_conffile
 
 refine_isp_configs() {
     echo "[netrt] 正在执行多 ISP 网络环境自动适配..."
